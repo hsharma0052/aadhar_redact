@@ -5,3 +5,5 @@ openpyxl>=3.1.0
 tqdm>=4.66.0
 requests-toolbelt>=1.0.0
 python-dotenv>=1.0.0
+pytesseract>=0.3.10
+Pillow>=10.2.0

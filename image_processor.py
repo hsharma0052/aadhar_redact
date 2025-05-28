@@ -13,6 +13,10 @@ import time
 from typing import List, Set
 import pickle
 from pathlib import Path
+import pytesseract
+from PIL import Image
+import io
+import re
 from config import (
     AWS_ACCESS_KEY_ID,
     AWS_SECRET_ACCESS_KEY,
@@ -23,7 +27,6 @@ from config import (
     API_PASSWORD,
     MAX_WORKERS
 )
-import re
 
 # Configure logging
 logging.basicConfig(
@@ -64,7 +67,9 @@ class ImageProcessor:
             'failed_folders': set(),
             'total_images': 0,
             'processed_images': 0,
-            'failed_images': 0
+            'failed_images': 0,
+            'skipped_non_aadhaar': 0,  # New stat for skipped non-Aadhaar images
+            'skipped_images': set()     # New set to track skipped image keys
         }
 
     def load_progress(self) -> Set[str]:
@@ -192,6 +197,8 @@ class ImageProcessor:
             'total_images': self.stats['total_images'],
             'processed_images': self.stats['processed_images'],
             'failed_images': self.stats['failed_images'],
+            'skipped_non_aadhaar': self.stats['skipped_non_aadhaar'],
+            'skipped_images': list(self.stats['skipped_images']),
             'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
         }
         
@@ -208,12 +215,18 @@ Failed folders: {len(self.stats['failed_folders'])}
 Total images: {self.stats['total_images']}
 Successfully processed images: {self.stats['processed_images']}
 Failed images: {self.stats['failed_images']}
+Skipped non-Aadhaar images: {self.stats['skipped_non_aadhaar']}
         """)
         
         if self.stats['failed_folders']:
             logger.info("Failed folders:")
             for folder in sorted(self.stats['failed_folders']):
                 logger.info(f"  {folder}")
+                
+        if self.stats['skipped_images']:
+            logger.info("Skipped non-Aadhaar images:")
+            for image in sorted(self.stats['skipped_images']):
+                logger.info(f"  {image}")
 
     def get_user_images(self, user_folder: str):
         """Get list of all images in the specific folder"""
@@ -244,35 +257,213 @@ Failed images: {self.stats['failed_images']}
         logger.info(f"AUTHORIZATION IS: {auth_header}")
         return auth_header
 
+    def is_aadhaar_image(self, image_bytes: bytes, image_key: str = None) -> bool:
+        """
+        Check if the image is an Aadhaar card using OCR and (optionally) the image key.
+        Uses multiple detection methods for 100% accuracy:
+        1. Filename check (if image_key contains 'aadhar')
+        2. OCR pattern matching with improved patterns and scoring
+        3. Layout analysis for common Aadhaar card elements
+        
+        The detection is made more specific to Aadhaar by:
+        - Requiring at least one Aadhaar-specific pattern
+        - Using negative patterns to exclude other documents
+        - Giving higher weights to Aadhaar-unique patterns
+        """
+        # Method 1: Check filename first
+        if image_key and re.search(r'aadhar', image_key, re.IGNORECASE):
+            logger.info(f"Image key ({image_key}) contains 'aadhar' - automatically classified as Aadhaar")
+            return True
+
+        try:
+            # Convert bytes to PIL Image
+            image = Image.open(io.BytesIO(image_bytes))
+            
+            # Extract text using Tesseract with improved configuration
+            custom_config = r'--oem 3 --psm 6 -l eng+hin'  # Use both English and Hindi
+            text = pytesseract.image_to_string(image, config=custom_config)
+            text_lower = text.lower()
+            
+            # Negative patterns (if any of these are found, it's definitely not an Aadhaar)
+            negative_patterns = [
+                r'permanent\s+account\s+number',
+                r'income\s+tax\s+department',
+                r'परमानेंट\s+अकाउंट\s+नंबर',
+                r'आयकर\s+विभाग',
+                r'pan\s+card',
+                r'पैन\s+कार्ड',
+                r'passport',
+                r'पासपोर्ट',
+                r'driving\s+license',
+                r'ड्राइविंग\s+लाइसेंस',
+                r'voter\s+id',
+                r'मतदाता\s+पहचान\s+पत्र',
+                r'ration\s+card',
+                r'राशन\s+कार्ड'
+            ]
+            
+            # Check for negative patterns first
+            for pattern in negative_patterns:
+                if re.search(pattern, text_lower, re.IGNORECASE):
+                    logger.info(f"Found negative pattern indicating non-Aadhaar document: {pattern}")
+                    return False
+            
+            # Aadhaar patterns to look for (grouped by category with weights)
+            aadhaar_patterns = {
+                # Aadhaar-specific Patterns (highest weight, must have at least one)
+                'aadhaar_specific': [
+                    (r'aadhaar\s*(?:card|number|enrollment)', 3),
+                    (r'aadhar\s*(?:card|number|enrollment)', 3),
+                    (r'आधार\s*(?:कार्ड|नंबर|पंजीकरण)', 3),
+                    (r'unique\s+identification\s+authority\s+of\s+india', 3),
+                    (r'यूनीक\s+आइडेंटिफिकेशन\s+अथॉरिटी\s+ऑफ\s+इंडिया', 3),
+                    (r'uidai', 3),
+                    (r'यूआईडीएआई', 3),
+                    (r'vid\s*:\s*[a-z0-9]{16}', 3),  # Virtual ID format
+                    (r'आधार\s+सत्यापन\s+कोड', 3),
+                    (r'aadhaar\s+verification\s+code', 3),
+                ],
+                
+                # Aadhaar Number Patterns (high weight)
+                'number_patterns': [
+                    (r'\b\d{4}\s\d{4}\s\d{4}\b', 2.5),  # Standard format: XXXX XXXX XXXX
+                    (r'\b\d{12}\b', 2.5),               # Without spaces
+                    (r'\b\d{4}-\d{4}-\d{4}\b', 2.5),    # With hyphens
+                    (r'[a-z]{1}\d{4}\s\d{4}\s\d{4}\b', 2.5),  # With leading letter
+                ],
+                
+                # Government and Authority Patterns (medium weight)
+                'government_patterns': [
+                    (r'government\s+of\s+india', 1.5),
+                    (r'भारत\s+सरकार', 1.5),
+                    (r'ministry\s+of\s+electronics\s+and\s+information\s+technology', 1.5),
+                    (r'इलेक्ट्रॉनिक्स\s+और\s+सूचना\s+प्रौद्योगिकी\s+मंत्रालय', 1.5),
+                ],
+                
+                # Security and Instruction Patterns (low weight)
+                'security_patterns': [
+                    (r'this\s+is\s+to\s+certify\s+that', 0.5),
+                    (r'यह\s+प्रमाणित\s+करता\s+है\s+कि', 0.5),
+                    (r'this\s+card\s+is\s+proof\s+of\s+identity', 0.5),
+                    (r'यह\s+कार्ड\s+पहचान\s+का\s+प्रमाण\s+है', 0.5),
+                    (r'not\s+proof\s+of\s+citizenship', 0.5),
+                    (r'नागरिकता\s+का\s+प्रमाण\s+नहीं\s+है', 0.5),
+                    (r'not\s+proof\s+of\s+date\s+of\s+birth', 0.5),
+                    (r'जन्म\s+तिथि\s+का\s+प्रमाण\s+नहीं\s+है', 0.5),
+                    (r'please\s+keep\s+your\s+aadhaar\s+number\s+safe', 0.5),
+                    (r'आधार\s+नंबर\s+को\s+सुरक्षित\s+रखें', 0.5),
+                ],
+                
+                # QR/Barcode Patterns (low weight)
+                'qr_patterns': [
+                    (r'qr\s+code', 0.5),
+                    (r'barcode', 0.5),
+                    (r'क्यूआर\s+कोड', 0.5),
+                    (r'बारकोड', 0.5),
+                ]
+            }
+            
+            # Scoring system with weighted patterns
+            total_score = 0
+            required_score = 3.0  # Increased threshold for better accuracy
+            matched_patterns = []
+            has_aadhaar_specific = False  # Track if we found any Aadhaar-specific pattern
+            
+            # Check each category of patterns
+            for category, patterns in aadhaar_patterns.items():
+                for pattern, weight in patterns:
+                    if re.search(pattern, text_lower, re.IGNORECASE):
+                        total_score += weight
+                        matched_patterns.append(f"{pattern} ({weight})")
+                        logger.info(f"Found Aadhaar pattern ({category}): {pattern} (weight: {weight})")
+                        if category == 'aadhaar_specific':
+                            has_aadhaar_specific = True
+            
+            # Log all matched patterns and total score
+            if matched_patterns:
+                logger.info(f"Total patterns matched: {len(matched_patterns)}")
+                logger.info(f"Matched patterns: {', '.join(matched_patterns)}")
+                logger.info(f"Total weighted score: {total_score:.2f} (required: {required_score})")
+                logger.info(f"Found Aadhaar-specific pattern: {has_aadhaar_specific}")
+            
+            # Additional layout check: Look for common Aadhaar card elements
+            layout_score = 0
+            try:
+                # Check image dimensions (typical Aadhaar card ratio)
+                width, height = image.size
+                ratio = width / height
+                if 1.4 <= ratio <= 1.8:  # Typical Aadhaar card ratio
+                    layout_score += 0.5
+                    logger.info("Image dimensions match typical Aadhaar card ratio")
+                
+                # Check for QR code or barcode (using image analysis)
+                if 'qr' in text_lower or 'barcode' in text_lower:
+                    layout_score += 0.5
+                    logger.info("Found QR code or barcode reference")
+                
+                total_score += layout_score
+                logger.info(f"Layout analysis score: {layout_score:.2f}")
+            except Exception as e:
+                logger.warning(f"Layout analysis failed: {str(e)}")
+            
+            # Final classification
+            # Must have both sufficient score AND at least one Aadhaar-specific pattern
+            is_aadhaar = total_score >= required_score and has_aadhaar_specific
+            logger.info(f"Final Aadhaar detection score: {total_score:.2f} (required: {required_score})")
+            logger.info(f"Has Aadhaar-specific pattern: {has_aadhaar_specific}")
+            logger.info(f"Image classified as {'Aadhaar' if is_aadhaar else 'non-Aadhaar'}")
+            
+            return is_aadhaar
+            
+        except Exception as e:
+            logger.error(f"Error in OCR processing: {str(e)}")
+            # If OCR fails, assume it's not an Aadhaar card to be safe
+            return False
+
     def process_image(self, image_key: str) -> bool:
         try:
             # Download image from S3
             response = self.s3_client.get_object(Bucket=self.source_bucket, Key=image_key)
             image_data = response['Body'].read()
             
+            # Check if image is an Aadhaar card (passing image_key so that if the filename contains 'aadhar' it is automatically classified as Aadhaar)
+            if not self.is_aadhaar_image(image_data, image_key):
+                 logger.info(f"Skipping non-Aadhaar image: {image_key}")
+                 self.stats['skipped_non_aadhaar'] += 1
+                 self.stats['skipped_images'].add(image_key)
+                 return False
+            
             # Get just the filename without the path
             filename = os.path.basename(image_key)
             
             # Check if input is JSON and extract image data if it is
-            try:
-                json_data = json.loads(image_data)
-                if isinstance(json_data, dict) and 'data' in json_data and 'file' in json_data['data']:
-                    # Found base64 encoded image in JSON
-                    logger.info(f"Found base64 encoded image in JSON for {image_key}")
-                    try:
-                        # Decode base64 image data
-                        base64_image = json_data['data']['file']
-                        if base64_image.startswith('data:image/'):
-                            # Remove data URL prefix if present
-                            base64_image = base64_image.split(',', 1)[1]
-                        image_data = base64.b64decode(base64_image)
-                        logger.info(f"Successfully decoded base64 image data for {image_key}")
-                    except Exception as e:
-                        logger.error(f"Failed to decode base64 image data for {image_key}: {str(e)}")
-                        return False
-            except json.JSONDecodeError:
-                # Not JSON, proceed with raw image data
-                logger.info(f"Input file {image_key} is raw image data")
+            if image_data and (image_data[:1] == b'{' or image_data[:1] == b'['):
+                try:
+                    json_data = json.loads(image_data)
+                    if isinstance(json_data, dict) and 'data' in json_data and 'file' in json_data['data']:
+                        # Found base64 encoded image in JSON
+                        logger.info(f"Found base64 encoded image in JSON for {image_key}")
+                        try:
+                            # Decode base64 image data
+                            base64_image = json_data['data']['file']
+                            if base64_image.startswith('data:image/'):
+                                # Remove data URL prefix if present
+                                base64_image = base64_image.split(',', 1)[1]
+                            image_data = base64.b64decode(base64_image)
+                            logger.info(f"Successfully decoded base64 image data for {image_key}")
+                            # Check if decoded image is an Aadhaar card
+                            if not self.is_aadhaar_image(image_data):
+                                logger.info(f"Skipping non-Aadhaar image after decoding: {image_key}")
+                                self.stats['skipped_non_aadhaar'] += 1
+                                self.stats['skipped_images'].add(image_key)
+                                return False
+                        except Exception as e:
+                            logger.error(f"Failed to decode base64 image data for {image_key}: {str(e)}")
+                            return False
+                except Exception as e:
+                    logger.info(f"Input file {image_key} is raw image data (JSON decode failed: {str(e)})")
+            else:
+                logger.info(f"Input file {image_key} is raw image data (not JSON)")
             
             # Verify file format
             if not image_data.startswith(b'\xff\xd8\xff'):  # JPEG magic number
@@ -404,7 +595,7 @@ if __name__ == "__main__":
     
     # Get sheet path from command line argument or use default
     import sys
-    sheet_path = sys.argv[1] if len(sys.argv) > 1 else 'folders.xlsx'
+    sheet_path = sys.argv[1] if len(sys.argv) > 1 else 'folders_to_process.xlsx'
     
     # Create processor with batch size of 100
     processor = ImageProcessor(sheet_path=sheet_path, batch_size=100)

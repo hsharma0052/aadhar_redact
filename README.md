@@ -37,7 +37,8 @@ pip install -r requirements.txt
 
 5. Prepare your folder list:
    - Use the provided `create_sample_excel.py` to create a template
-   - Replace the sample data in `folders_to_process.xlsx` with your folder names
+   - Or use the included `folders_to_process.sample.xlsx` as a reference
+   - **Place your real Excel file as `folders_to_process.xlsx` in the root of the code directory** (same directory as `image_processor.py`)
    - Keep the 'folder' column name as is
 
 ## Usage
@@ -62,6 +63,7 @@ python image_processor.py path/to/your/folders.xlsx
 - `image_processor.py`: Main processing script
 - `config.example.py`: Template for configuration
 - `create_sample_excel.py`: Script to create folder list template
+- `folders_to_process.sample.xlsx`: Sample Excel file for folder list (do not use for real processing)
 - `requirements.txt`: Python package dependencies
 - `.gitignore`: Git ignore rules
 - `README.md`: This documentation
