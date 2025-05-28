@@ -61,6 +61,9 @@ class ImageProcessor:
         self.progress_file = 'processing_progress.pkl'
         self.processed_folders: Set[str] = self.load_progress()
         
+        # Initialize folder processing results
+        self.folder_results = {}  # Store results for each folder
+        
         self.stats = {
             'total_folders': 0,
             'processed_folders': 0,
@@ -68,8 +71,8 @@ class ImageProcessor:
             'total_images': 0,
             'processed_images': 0,
             'failed_images': 0,
-            'skipped_non_aadhaar': 0,  # New stat for skipped non-Aadhaar images
-            'skipped_images': set()     # New set to track skipped image keys
+            'skipped_non_aadhaar': 0,
+            'skipped_images': set()
         }
 
     def load_progress(self) -> Set[str]:
@@ -92,20 +95,20 @@ class ImageProcessor:
             logger.error(f"Error saving progress file: {str(e)}")
 
     def get_folders_from_sheet(self) -> List[str]:
-        """Read folder names from the sheet"""
+        """Read folder names from the sheet and initialize folder results"""
         try:
             # Determine file type and read accordingly
             file_ext = Path(self.sheet_path).suffix.lower()
             if file_ext == '.csv':
-                df = pd.read_csv(self.sheet_path)
+                self.df = pd.read_csv(self.sheet_path)
             elif file_ext in ['.xlsx', '.xls']:
-                df = pd.read_excel(self.sheet_path)
+                self.df = pd.read_excel(self.sheet_path)
             else:
                 raise ValueError(f"Unsupported file format: {file_ext}")
             
             # Assuming the folder names are in a column named 'folder' or the first column
-            folder_column = 'folder' if 'folder' in df.columns else df.columns[0]
-            folders = df[folder_column].astype(str).tolist()
+            folder_column = 'folder' if 'folder' in self.df.columns else self.df.columns[0]
+            folders = self.df[folder_column].astype(str).tolist()
             
             # Filter out already processed folders
             folders = [f for f in folders if f not in self.processed_folders]
@@ -113,11 +116,94 @@ class ImageProcessor:
             # Ensure folder names end with '/'
             folders = [f if f.endswith('/') else f + '/' for f in folders]
             
+            # Initialize folder results
+            for folder in folders:
+                if folder not in self.folder_results:
+                    self.folder_results[folder] = {
+                        'status': 'Pending',
+                        'aadhaar_images': [],
+                        'non_aadhaar_images': [],
+                        'processed_images': [],
+                        'failed_images': [],
+                        'last_updated': None
+                    }
+            
             logger.info(f"Found {len(folders)} folders to process")
             return folders
         except Exception as e:
             logger.error(f"Error reading sheet: {str(e)}")
             return []
+
+    def update_folder_result(self, folder: str, image_key: str, status: str, is_aadhaar: bool = None):
+        """Update the processing result for a specific folder and image"""
+        if folder not in self.folder_results:
+            self.folder_results[folder] = {
+                'status': 'Pending',
+                'aadhaar_images': [],
+                'non_aadhaar_images': [],
+                'processed_images': [],
+                'failed_images': [],
+                'last_updated': None
+            }
+        
+        # Update image classification
+        if is_aadhaar is not None:
+            if is_aadhaar:
+                if image_key not in self.folder_results[folder]['aadhaar_images']:
+                    self.folder_results[folder]['aadhaar_images'].append(image_key)
+            else:
+                if image_key not in self.folder_results[folder]['non_aadhaar_images']:
+                    self.folder_results[folder]['non_aadhaar_images'].append(image_key)
+        
+        # Update processing status
+        if status == 'processed':
+            if image_key not in self.folder_results[folder]['processed_images']:
+                self.folder_results[folder]['processed_images'].append(image_key)
+        elif status == 'failed':
+            if image_key not in self.folder_results[folder]['failed_images']:
+                self.folder_results[folder]['failed_images'].append(image_key)
+        
+        # Update folder status
+        if len(self.folder_results[folder]['failed_images']) > 0:
+            self.folder_results[folder]['status'] = 'Failed'
+        elif len(self.folder_results[folder]['processed_images']) > 0:
+            self.folder_results[folder]['status'] = 'Completed'
+        
+        # Update timestamp
+        self.folder_results[folder]['last_updated'] = time.strftime('%Y-%m-%d %H:%M:%S')
+        
+        # Save to Excel after each update
+        self.save_results_to_excel()
+
+    def save_results_to_excel(self):
+        """Save the processing results to Excel"""
+        try:
+            # Create a new DataFrame for results
+            results_data = []
+            for folder, result in self.folder_results.items():
+                results_data.append({
+                    'Folder': folder,
+                    'Status': result['status'],
+                    'Aadhaar Images': ', '.join(result['aadhaar_images']),
+                    'Non-Aadhaar Images': ', '.join(result['non_aadhaar_images']),
+                    'Processed Images': ', '.join(result['processed_images']),
+                    'Failed Images': ', '.join(result['failed_images']),
+                    'Last Updated': result['last_updated']
+                })
+            
+            # Create results DataFrame
+            results_df = pd.DataFrame(results_data)
+            
+            # Save to Excel with two sheets
+            with pd.ExcelWriter(self.sheet_path, engine='openpyxl') as writer:
+                # Original data sheet
+                self.df.to_excel(writer, sheet_name='Folders', index=False)
+                # Results sheet
+                results_df.to_excel(writer, sheet_name='Processing Results', index=False)
+            
+            logger.info(f"Updated Excel file with processing results: {self.sheet_path}")
+        except Exception as e:
+            logger.error(f"Error saving results to Excel: {str(e)}")
 
     def process_batch(self, folders: List[str]):
         """Process a batch of folders"""
@@ -131,6 +217,7 @@ class ImageProcessor:
                     logger.warning(f"No images found in folder {folder}")
                     self.processed_folders.add(folder)
                     self.save_progress()
+                    self.update_folder_result(folder, '', 'no_images')
                     continue
                 
                 successful = 0
@@ -160,6 +247,7 @@ class ImageProcessor:
             except Exception as e:
                 logger.error(f"Error processing folder {folder}: {str(e)}")
                 self.stats['failed_folders'].add(folder)
+                self.update_folder_result(folder, '', 'error', error=str(e))
 
     def run(self):
         """Main processing loop with batch processing"""
@@ -422,16 +510,21 @@ Skipped non-Aadhaar images: {self.stats['skipped_non_aadhaar']}
 
     def process_image(self, image_key: str) -> bool:
         try:
+            # Get folder name from image key
+            folder = '/'.join(image_key.split('/')[:-1]) + '/'
+            
             # Download image from S3
             response = self.s3_client.get_object(Bucket=self.source_bucket, Key=image_key)
             image_data = response['Body'].read()
             
-            # Check if image is an Aadhaar card (passing image_key so that if the filename contains 'aadhar' it is automatically classified as Aadhaar)
-            if not self.is_aadhaar_image(image_data, image_key):
-                 logger.info(f"Skipping non-Aadhaar image: {image_key}")
-                 self.stats['skipped_non_aadhaar'] += 1
-                 self.stats['skipped_images'].add(image_key)
-                 return False
+            # Check if image is an Aadhaar card
+            is_aadhaar = self.is_aadhaar_image(image_data, image_key)
+            if not is_aadhaar:
+                logger.info(f"Skipping non-Aadhaar image: {image_key}")
+                self.stats['skipped_non_aadhaar'] += 1
+                self.stats['skipped_images'].add(image_key)
+                self.update_folder_result(folder, image_key, 'skipped', False)
+                return False
             
             # Get just the filename without the path
             filename = os.path.basename(image_key)
@@ -456,6 +549,7 @@ Skipped non-Aadhaar images: {self.stats['skipped_non_aadhaar']}
                                 logger.info(f"Skipping non-Aadhaar image after decoding: {image_key}")
                                 self.stats['skipped_non_aadhaar'] += 1
                                 self.stats['skipped_images'].add(image_key)
+                                self.update_folder_result(folder, image_key, 'skipped', False)
                                 return False
                         except Exception as e:
                             logger.error(f"Failed to decode base64 image data for {image_key}: {str(e)}")
@@ -569,11 +663,16 @@ Skipped non-Aadhaar images: {self.stats['skipped_non_aadhaar']}
                 ContentType='image/jpeg'  # Explicitly set content type
             )
             
+            # Update folder result on success
+            self.update_folder_result(folder, image_key, 'processed', True)
             logger.info(f"Successfully processed and uploaded image: {image_key}")
             return True
             
         except Exception as e:
             logger.error(f"Error processing image {image_key}: {str(e)}")
+            # Update folder result on failure
+            folder = '/'.join(image_key.split('/')[:-1]) + '/'
+            self.update_folder_result(folder, image_key, 'failed')
             return False
 
 if __name__ == "__main__":
